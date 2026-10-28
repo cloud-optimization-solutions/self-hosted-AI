@@ -1,2 +1,2 @@
 # self-hosted-aws-
-AI-Starter-ollama-n8n-librechat
+Script for creating a self-hosted AI Sandbox for evaluating self-hosted AI project integrated into an AI Ecosystem.
