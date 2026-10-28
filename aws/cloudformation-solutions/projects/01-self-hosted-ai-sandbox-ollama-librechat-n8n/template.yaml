@@ -1,0 +1,856 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: LibreChat, n8n workflow automation, and GPU Ollama on private EC2 instances in one VPC with HTTPS ALB and SSM endpoints.
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.40.0.0/24
+    Description: A /24 IPv4 VPC CIDR, for example 10.40.0.0/24. Ensure it does not overlap connected networks.
+    AllowedPattern: '^([0-9]{1,3}\.){3}0/24$'
+    ConstraintDescription: Provide an aligned /24 CIDR, for example 10.40.0.0/24.
+  AlbScheme:
+    Type: String
+    Default: internal
+    AllowedValues: [internal, internet-facing]
+  AllowedClientCidr:
+    Type: String
+    Description: Client IPv4 CIDR allowed to connect to the ALB on port 443.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'
+    ConstraintDescription: Provide an IPv4 CIDR such as 10.0.0.0/8.
+  AmazonLinuxAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM public parameter for an Amazon Linux 2023 x86_64 AMI.
+  InstanceType:
+    Type: String
+    Default: t3.large
+    Description: x86_64 EC2 instance type; default provides 2 vCPUs and 8 GiB RAM.
+  RootVolumeGiB:
+    Type: Number
+    Default: 40
+    MinValue: 30
+    MaxValue: 16384
+  N8nInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for the dedicated n8n workflow server.
+  N8nVolumeGiB:
+    Type: Number
+    Default: 40
+    MinValue: 30
+    MaxValue: 16384
+    Description: Encrypted n8n root EBS volume size in GiB.
+  N8nImageTag:
+    Type: String
+    Default: '1.119.1'
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    Description: Pinned n8n Docker image version; validate before deployment.
+  LibreChatGitRef:
+    Type: String
+    Default: main
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+    Description: LibreChat branch or release tag to check out; select and test a release tag for production.
+  OllamaDefaultModel:
+    Type: String
+    Default: 'llama3.1:latest'
+    Description: An installed Ollama model name, used as the default in LibreChat.
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]*$'
+  EnableBedrock:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Grant this instance Bedrock invoke permissions. Model access and configuration may also be required.
+  DeepLearningAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: x86_64 Deep Learning Base OSS Nvidia Driver GPU AMI (Amazon Linux 2023) in this Region, compatible with G4dn.
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 100
+    MinValue: 50
+    MaxValue: 16384
+    Description: Root volume in GiB; must be at least the selected AMI snapshot size.
+
+Conditions:
+  IsInternalAlb: !Equals [!Ref AlbScheme, internal]
+  UseBedrock: !Equals [!Ref EnableBedrock, 'true']
+Resources:
+  HostedAiResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub '${AWS::StackName}-hosted-ai'
+      Description: Tagged resources for this hosted AI deployment.
+      ResourceQuery:
+        Type: TAG_FILTERS_1_0
+        Query:
+          ResourceTypeFilters: [AWS::AllSupported]
+          TagFilters:
+            - Key: Application
+              Values: [cos-hosted-ai-base]
+            - Key: DeploymentStack
+              Values: [!Ref 'AWS::StackName']
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}, {Key: Application, Value: cos-hosted-ai-base}, {Key: DeploymentStack, Value: !Ref 'AWS::StackName'}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-igw'}]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 8, 5]]
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-1'}]
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 8, 5]]
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-2'}]
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 6]]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-private-1'}]
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 2, 7]]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-private-2'}]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-rt'}]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable}
+  PublicAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable}
+  NatAddress:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties: {Domain: vpc}
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicDefaultRoute
+    Properties:
+      AllocationId: !GetAtt NatAddress.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-nat'}]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-private-rt'}]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable}
+  PrivateAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable}
+  OllamaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow the Ollama API from the LibreChat EC2 instance.
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Application
+          Value: cos-hosted-ai-base
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 11434
+          ToPort: 11434
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+          Description: Ollama API from LibreChat
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Outbound IPv4 access for installation and updates
+
+  SsmEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from the Ollama instance to Systems Manager endpoints.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref OllamaSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-ssm-endpoints'}
+        - {Key: Application, Value: cos-hosted-ai-base}
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SsmEndpointSecurityGroup
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-ssm'}
+        - {Key: Application, Value: cos-hosted-ai-base}
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SsmEndpointSecurityGroup
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-ssmmessages'}
+        - {Key: Application, Value: cos-hosted-ai-base}
+
+  OllamaInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Application
+          Value: cos-hosted-ai-base
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  OllamaInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref OllamaInstanceRole
+
+  OllamaBootstrapHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  OllamaBootstrapWait:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: OllamaInstance
+    Properties:
+      Handle: !Ref OllamaBootstrapHandle
+      Timeout: '1800'
+      Count: 1
+  OllamaInstance:
+    DependsOn:
+      - PrivateDefaultRoute
+      - PublicDefaultRoute
+      - PublicAssociation1
+      - PrivateAssociation1
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref DeepLearningAmiId
+      InstanceType: g4dn.xlarge
+      PropagateTagsToVolumeOnCreation: true
+      IamInstanceProfile: !Ref OllamaInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PrivateSubnet1
+          GroupSet:
+            - !Ref OllamaSecurityGroup
+          AssociatePublicIpAddress: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref RootVolumeSizeGiB
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: DeploymentStack
+          Value: !Ref AWS::StackName
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ollama'
+        - Key: Application
+          Value: cos-hosted-ai-base
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -Eeuo pipefail
+          exec > >(tee -a /var/log/ollama-bootstrap.log | logger -t ollama-bootstrap -s 2>/dev/console) 2>&1
+          signal_ollama() {
+            rc=$?
+            trap - EXIT
+            status=SUCCESS
+            [ "$rc" -eq 0 ] || status=FAILURE
+            curl --retry 5 --retry-delay 3 -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$status\",\"Reason\":\"See /var/log/ollama-bootstrap.log\",\"UniqueId\":\"ollama-bootstrap\",\"Data\":\"bootstrap exit $rc\"}" '${OllamaBootstrapHandle}' || true
+            exit "$rc"
+          }
+          trap signal_ollama EXIT
+
+          echo "Checking NVIDIA driver"
+          nvidia-smi
+
+          echo "Installing Ollama"
+          curl --fail --silent --show-error --location --retry 5 --retry-delay 5 https://ollama.com/install.sh | sh
+
+          echo "Configuring Ollama to listen on port 11434 for VPC clients"
+          install -d -m 0755 /etc/systemd/system/ollama.service.d
+          cat > /etc/systemd/system/ollama.service.d/10-vpc-listen.conf <<'CONFIG'
+          [Service]
+          Environment="OLLAMA_HOST=0.0.0.0:11434"
+          CONFIG
+
+          systemctl daemon-reload
+          systemctl enable ollama
+          systemctl restart ollama
+          systemctl is-active --quiet ollama
+          curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused http://127.0.0.1:11434/api/tags
+          echo
+          echo "Ollama installation complete. No models were downloaded."
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LibreChat HTTPS client access
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedClientCidr
+  N8nAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      CidrIp: !Ref AllowedClientCidr
+      Description: Client HTTPS access to n8n
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LibreChat traffic from load balancer only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3080
+          ToPort: 3080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+  N8nInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: n8n HTTP traffic only from the application load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5678
+          ToPort: 5678
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-n8n-sg'}
+        - {Key: Application, Value: cos-hosted-ai-base}
+  N8nToOllamaIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref OllamaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 11434
+      ToPort: 11434
+      SourceSecurityGroupId: !Ref N8nInstanceSecurityGroup
+      Description: Allow n8n workflows to call Ollama API
+  N8nInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+  N8nInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref N8nInstanceRole]
+  N8nBootstrapHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  N8nBootstrapWait:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: N8nInstance
+    Properties:
+      Handle: !Ref N8nBootstrapHandle
+      Timeout: '1800'
+      Count: 1
+  N8nInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PrivateDefaultRoute, PrivateAssociation1, PublicAssociation1]
+    Properties:
+      ImageId: !Ref AmazonLinuxAmi
+      InstanceType: !Ref N8nInstanceType
+      IamInstanceProfile: !Ref N8nInstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PrivateSubnet1
+          GroupSet: [!Ref N8nInstanceSecurityGroup]
+          AssociatePublicIpAddress: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref N8nVolumeGiB
+            Encrypted: true
+            DeleteOnTermination: false
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-n8n'}
+        - {Key: Application, Value: cos-hosted-ai-base}
+        - {Key: DeploymentStack, Value: !Ref 'AWS::StackName'}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -Eeuo pipefail
+          exec > >(tee -a /var/log/n8n-bootstrap.log | logger -t n8n-bootstrap -s 2>/dev/console) 2>&1
+          signal_n8n() {
+            rc=$?
+            trap - EXIT
+            status=SUCCESS
+            [ "$rc" -eq 0 ] || status=FAILURE
+            curl --retry 5 --retry-delay 3 -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$status\",\"Reason\":\"See /var/log/n8n-bootstrap.log\",\"UniqueId\":\"n8n-bootstrap\",\"Data\":\"bootstrap exit $rc\"}" '${N8nBootstrapHandle}' || true
+            exit "$rc"
+          }
+          trap signal_n8n EXIT
+          dnf install -y docker openssl
+          systemctl enable --now docker
+          mkdir -p /opt/n8n/data
+          chown -R 1000:1000 /opt/n8n/data
+          chmod 700 /opt/n8n/data
+          umask 077
+          cat > /opt/n8n/.env <<'ENVFILE'
+          N8N_ENCRYPTION_KEY=__GENERATED_AT_BOOT__
+          N8N_IMAGE_TAG=${N8nImageTag}
+          N8N_HOST=${LoadBalancer.DNSName}
+          N8N_EDITOR_BASE_URL=https://${LoadBalancer.DNSName}:8443/
+          WEBHOOK_URL=https://${LoadBalancer.DNSName}:8443/
+          ENVFILE
+          sed -i "s/__GENERATED_AT_BOOT__/$(openssl rand -hex 32)/" /opt/n8n/.env
+          chmod 600 /opt/n8n/.env
+          cat > /opt/n8n/compose.yaml <<'COMPOSE'
+          services:
+            n8n:
+              image: docker.n8n.io/n8nio/n8n:${!N8N_IMAGE_TAG}
+              restart: unless-stopped
+              ports:
+                - '5678:5678'
+              env_file:
+                - .env
+              environment:
+                - N8N_PORT=5678
+                - N8N_PROTOCOL=https
+                - N8N_PROXY_HOPS=1
+                - N8N_SECURE_COOKIE=true
+                - N8N_DIAGNOSTICS_ENABLED=false
+              volumes:
+                - /opt/n8n/data:/home/node/.n8n
+          COMPOSE
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -fsSL --retry 5 --retry-delay 3 https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+          cd /opt/n8n
+          docker compose config -q
+          docker compose pull
+          docker compose up -d
+          for attempt in $(seq 1 90); do
+            if curl -fsS -o /dev/null http://127.0.0.1:5678/healthz; then exit 0; fi
+            sleep 10
+          done
+          echo 'n8n did not become healthy in time'
+          docker compose ps
+          docker compose logs --tail=100 n8n
+          exit 1
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ImportSelfSignedCertificate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: acm:ImportCertificate
+                Resource: '*'
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/librechat/${AWS::StackName}/certificate-arn'
+        - !If
+          - UseBedrock
+          - PolicyName: BedrockInference
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                  Resource: '*'
+          - !Ref AWS::NoValue
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 3080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher: {HttpCode: '200-399'}
+      Targets:
+        - Id: !Ref Instance
+          Port: 3080
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: !Ref AlbScheme
+      Subnets: !If [IsInternalAlb, [!Ref PrivateSubnet1, !Ref PrivateSubnet2], [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !GetAtt SelfSignedCertificate.CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+  N8nTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 5678
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /healthz
+      Matcher: {HttpCode: '200-399'}
+      Targets:
+        - Id: !Ref N8nInstance
+          Port: 5678
+  N8nListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: N8nBootstrapWait
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !GetAtt SelfSignedCertificate.CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref N8nTargetGroup
+  CertificateCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CertificateCleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:DeleteParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/librechat/${AWS::StackName}/certificate-arn'
+              - Effect: Allow
+                Action: acm:DeleteCertificate
+                Resource: !Sub 'arn:${AWS::Partition}:acm:${AWS::Region}:${AWS::AccountId}:certificate/*'
+  CertificateCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CertificateCleanupRole.Arn
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              ssm = boto3.client('ssm')
+              acm = boto3.client('acm')
+              name = event['ResourceProperties']['ParameterName']
+              request = event['RequestType']
+              physical = event.get('PhysicalResourceId', name)
+              try:
+                  if request == 'Delete':
+                      try:
+                          cert = ssm.get_parameter(Name=name)['Parameter']['Value']
+                      except ssm.exceptions.ParameterNotFound:
+                          cert = None
+                      if cert:
+                          try:
+                              acm.delete_certificate(CertificateArn=cert)
+                          except acm.exceptions.ResourceNotFoundException:
+                              pass
+                          ssm.delete_parameter(Name=name)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical)
+                      return
+                  if request == 'Update' and event['ResourceProperties']['Hostname'] != event.get('OldResourceProperties', {}).get('Hostname'):
+                      raise ValueError('Hostname cannot be changed in place; create a new stack.')
+                  cert = ssm.get_parameter(Name=name)['Parameter']['Value']
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'CertificateArn': cert}, physical)
+              except Exception as exc:
+                  print('Certificate resource failed:', str(exc))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(exc)}, physical)
+  SelfSignedCertificate:
+    Type: Custom::SelfSignedCertificate
+    DependsOn: BootstrapWait
+    Properties:
+      ServiceToken: !GetAtt CertificateCleanupFunction.Arn
+      ServiceTimeout: '300'
+      ParameterName: !Sub '/librechat/${AWS::StackName}/certificate-arn'
+      Hostname: !GetAtt LoadBalancer.DNSName
+  BootstrapHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  BootstrapWait:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Instance
+    Properties:
+      Handle: !Ref BootstrapHandle
+      Timeout: '1800'
+      Count: 1
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PrivateDefaultRoute, PrivateAssociation1, PublicAssociation1, OllamaBootstrapWait]
+    Properties:
+      ImageId: !Ref AmazonLinuxAmi
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PrivateSubnet1
+          GroupSet: [!Ref InstanceSecurityGroup, !Ref OllamaSecurityGroup]
+          AssociatePublicIpAddress: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref RootVolumeGiB
+            Encrypted: true
+            DeleteOnTermination: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-librechat'
+        - Key: Application
+          Value: cos-hosted-ai-base
+        - Key: DeploymentStack
+          Value: !Ref AWS::StackName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -Eeuo pipefail
+          exec > >(tee -a /var/log/librechat-bootstrap.log) 2>&1
+          signal_result() {
+            rc=$?
+            trap - EXIT
+            status=SUCCESS
+            [ "$rc" -eq 0 ] || status=FAILURE
+            curl --retry 5 --retry-delay 3 -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$status\",\"Reason\":\"See /var/log/librechat-bootstrap.log on the instance\",\"UniqueId\":\"librechat-bootstrap\",\"Data\":\"bootstrap exit $rc\"}" '${BootstrapHandle}' || true
+            exit "$rc"
+          }
+          trap signal_result EXIT
+          dnf install -y docker git openssl python3 awscli-2
+          systemctl enable --now docker
+          # Keep the private key in memory-backed storage and remove it after import.
+          umask 077
+          cert_dir=$(mktemp -d /dev/shm/librechat-cert.XXXXXX)
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 -keyout "$cert_dir/key.pem" -out "$cert_dir/cert.pem" -subj '/CN=LibreChat' -addext 'subjectAltName=DNS:${LoadBalancer.DNSName}'
+          cert_arn=$(aws acm import-certificate --region '${AWS::Region}' --certificate "fileb://$cert_dir/cert.pem" --private-key "fileb://$cert_dir/key.pem" --query CertificateArn --output text)
+          rm -rf "$cert_dir"
+          aws ssm put-parameter --region '${AWS::Region}' --name '/librechat/${AWS::StackName}/certificate-arn' --type String --value "$cert_arn" --overwrite >/dev/null
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -fsSL --retry 5 --retry-delay 3 https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+          docker compose version
+          mkdir -p /opt/librechat
+          git clone --branch '${LibreChatGitRef}' --single-branch https://github.com/LibreChat-AI/LibreChat.git /opt/librechat/app
+          cd /opt/librechat/app
+          cp .env.example .env
+          chmod 600 .env
+          export APP_HOSTNAME='${LoadBalancer.DNSName}'
+          export APP_REGION='${AWS::Region}'
+          python3 - <<'PY'
+          import os, re, secrets
+          path = '.env'
+          text = open(path).read()
+          values = {
+              'DOMAIN_CLIENT': 'https://' + os.environ['APP_HOSTNAME'],
+              'DOMAIN_SERVER': 'https://' + os.environ['APP_HOSTNAME'],
+              'CREDS_KEY': secrets.token_hex(32),
+              'CREDS_IV': secrets.token_hex(16),
+              'JWT_SECRET': secrets.token_hex(32),
+              'JWT_REFRESH_SECRET': secrets.token_hex(32),
+              'ADMIN_PANEL_SESSION_SECRET': secrets.token_hex(32),
+              'MEILI_MASTER_KEY': secrets.token_hex(32),
+              'BEDROCK_AWS_DEFAULT_REGION': os.environ['APP_REGION'],
+              'ALLOW_REGISTRATION': 'true',
+          }
+          for key, value in values.items():
+              pattern = r'(?m)^#?\s*' + re.escape(key) + r'=.*$'
+              if re.search(pattern, text):
+                  text = re.sub(pattern, key + '=' + value, text, count=1)
+              else:
+                  text += '\n' + key + '=' + value + '\n'
+          with open(path, 'w') as f:
+              f.write(text)
+          PY
+          cat > librechat.yaml <<'YAML'
+          version: 1.3.18
+          cache: true
+          endpoints:
+            custom:
+              - name: "Ollama"
+                apiKey: "ollama"
+                baseURL: "http://${OllamaInstance.PrivateIp}:11434/v1/"
+                models:
+                  default:
+                    - "${OllamaDefaultModel}"
+                  fetch: true
+                titleConvo: true
+                titleModel: "current_model"
+                modelDisplayLabel: "Ollama"
+          YAML
+          cat > docker-compose.override.yml <<'YAML'
+          services:
+            api:
+              volumes:
+                - type: bind
+                  source: ./librechat.yaml
+                  target: /app/librechat.yaml
+          YAML
+          docker compose config -q
+          docker compose pull
+          docker compose up -d
+          for attempt in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3080/; then exit 0; fi
+            sleep 10
+          done
+          echo 'LibreChat did not respond on port 3080 in time.'
+          docker compose ps
+          docker compose logs --tail=100 api
+          exit 1
+Outputs:
+  N8nApplicationURL:
+    Value: !Sub 'https://${LoadBalancer.DNSName}:8443/'
+    Description: n8n editor URL (self-signed certificate; private network access needed for internal ALB).
+  N8nInstanceId:
+    Value: !Ref N8nInstance
+  N8nOllamaApiUrl:
+    Value: !Sub 'http://${OllamaInstance.PrivateIp}:11434'
+    Description: Ollama API endpoint available from n8n workflows inside the VPC.
+  N8nBootstrapLog:
+    Value: /var/log/n8n-bootstrap.log
+  ResourceGroupName:
+    Value: !Ref HostedAiResourceGroup
+  OllamaInstanceId:
+    Value: !Ref OllamaInstance
+  OllamaPrivateIp:
+    Value: !GetAtt OllamaInstance.PrivateIp
+  OllamaApiUrl:
+    Value: !Sub 'http://${OllamaInstance.PrivateIp}:11434'
+  SsmEndpointId:
+    Value: !Ref SsmEndpoint
+  SsmMessagesEndpointId:
+    Value: !Ref SsmMessagesEndpoint
+  VpcId:
+    Value: !Ref Vpc
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+  NatGatewayId:
+    Value: !Ref NatGateway
+  ApplicationURL:
+    Value: !Sub 'https://${LoadBalancer.DNSName}'
+    Description: AWS-generated load balancer URL; internal scheme requires private network access.
+  LoadBalancerDNSName:
+    Value: !GetAtt LoadBalancer.DNSName
+  LoadBalancerCanonicalHostedZoneId:
+    Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+  InstanceId:
+    Value: !Ref Instance
+  CertificateArn:
+    Description: Automatically generated, self-signed ACM certificate; expires after 365 days.
+    Value: !GetAtt SelfSignedCertificate.CertificateArn
+  BootstrapLog:
+    Value: /var/log/librechat-bootstrap.log

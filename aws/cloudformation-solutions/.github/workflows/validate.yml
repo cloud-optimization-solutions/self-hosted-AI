@@ -1,0 +1,15 @@
+name: Validate CloudFormation templates
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cfn-lint
+      - run: find projects -name 'template.yaml' -print0 | xargs -0 -r -n1 cfn-lint
